@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "backend/discord-bot",
+    "backend/backend-svc"
+]
