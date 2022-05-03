@@ -1,18 +1,27 @@
-use std::{net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
     extract::Path,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post, delete},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use futures::StreamExt;
-use mongodb::{bson::{oid::ObjectId, doc}, options::ClientOptions, Client};
+use mongodb::{
+    bson::{doc, oid::ObjectId},
+    options::ClientOptions,
+    results::DeleteResult,
+    Client,
+};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::log;
+
+use crate::discord_bot::{DiscordBotAPI, DynDiscordBotAPI, ExternalDiscordBotAPI};
+
+mod discord_bot;
 
 static CONFIG: Lazy<Config> = Lazy::new(|| match envy::from_env::<Config>() {
     Ok(config) => config,
@@ -26,11 +35,13 @@ struct Config {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Ticket {
+#[serde(rename_all = "camelCase")]
+pub struct Ticket {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     id: Option<ObjectId>,
     title: String,
     content: String,
+    channel_id: Option<u64>,
 }
 
 impl Ticket {
@@ -54,12 +65,16 @@ async fn main() -> anyhow::Result<()> {
     // Get a handle to the deployment.
     let client = Client::with_options(client_options)?;
 
+    let discord_api =
+        Arc::new(ExternalDiscordBotAPI::with_url("http://localhost:3001")) as DynDiscordBotAPI;
+
     // build our application with a route
     let app = Router::new()
         .route("/tickets", get(get_tickets))
         .route("/tickets", post(add_ticket))
         .route("/tickets/:mongo_id", delete(delete_ticket))
-        .layer(Extension(client));
+        .layer(Extension(client))
+        .layer(Extension(discord_api));
 
     // run our app with hyper
     // `axum::Server` is a re-export of `hyper::Server`
@@ -76,11 +91,12 @@ async fn main() -> anyhow::Result<()> {
 async fn delete_ticket(
     Extension(mongodb): Extension<Client>,
     Path(ticket_id): Path<String>,
+    Extension(discord_bot): Extension<DynDiscordBotAPI>,
 ) -> impl IntoResponse {
-    let data = mongodb
+    let result = mongodb
         .database(&CONFIG.mongo_database)
         .collection::<Ticket>("tickets")
-        .delete_one(
+        .find_one(
             doc! {
                 "_id": ObjectId::from_str(&ticket_id).expect("Couldn't transform OID")
             },
@@ -88,17 +104,52 @@ async fn delete_ticket(
         )
         .await;
 
-    if let Ok(data) = data {
-
-        log::debug!("{data:?}");
-
-        (StatusCode::OK, Json(json!({})))
-    } else {
-        let why = data.unwrap_err().to_string();
+    if let Err(why) = result {
         (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": why })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": why.to_string() })),
         )
+    } else {
+        if let Some(ticket) = result.unwrap() {
+            if let Err(why) = discord_bot.remove_ticket(&ticket).await {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": why.to_string()
+                    })),
+                )
+            } else {
+                let result = mongodb
+                    .database(&CONFIG.mongo_database)
+                    .collection::<Ticket>("tickets")
+                    .delete_one(
+                        doc! {
+                            "_id": ObjectId::from_str(&ticket_id).expect("Couldn't transform OID")
+                        },
+                        None,
+                    )
+                    .await;
+
+                if let Ok(DeleteResult {
+                    deleted_count: 1, ..
+                }) = result
+                {
+                    (StatusCode::OK, Json(json!({})))
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": result.unwrap_err().to_string()
+                        })),
+                    )
+                }
+            }
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Could not find ticket" })),
+            )
+        }
     }
 }
 
@@ -129,16 +180,36 @@ async fn get_tickets(Extension(mongodb): Extension<Client>) -> impl IntoResponse
 async fn add_ticket(
     Json(ticket): Json<Ticket>,
     Extension(mongodb): Extension<Client>,
+    Extension(discord_bot): Extension<DynDiscordBotAPI>,
 ) -> impl IntoResponse {
-    let ticket_to_insert = ticket.with_id();
+    let mut ticket_to_insert = ticket.with_id();
+    
+    log::debug!("Sending ticket to discord bot");
+    
+    let result = discord_bot.add_ticket(&ticket_to_insert).await;
 
-    let data = mongodb
-        .database(&CONFIG.mongo_database)
-        .collection::<Ticket>("tickets")
-        .insert_one(&ticket_to_insert, None)
-        .await;
+    if let Err(why) = result {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": why.to_string()
+            })),
+        )
+    } else {
+        let channel_id = result.unwrap();
+        
+        ticket_to_insert.channel_id = Some(channel_id);
+        
+        log::debug!("Inserting ticket {ticket_to_insert:?}");
+        let data = mongodb
+            .database(&CONFIG.mongo_database)
+            .collection::<Ticket>("tickets")
+            .insert_one(&ticket_to_insert, None)
+            .await;
 
-    log::debug!("Inserting ticket {data:?}");
+        let value = serde_json::to_value(&ticket_to_insert).unwrap();
 
-    (StatusCode::OK, Json(ticket_to_insert))
+        (StatusCode::OK, Json(value))
+    }
+
 }
